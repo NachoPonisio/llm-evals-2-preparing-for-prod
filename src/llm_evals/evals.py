@@ -2,26 +2,33 @@ import json
 import os
 import sys
 import uuid
-
+from pathlib import Path
 
 import dotenv
 from langchain_community.docstore.document import Document
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
-from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate, PromptTemplate
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage, trim_messages
+from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams
+from langchain_redis import RedisChatMessageHistory
+from langchain_redis.chat_message_history import BaseChatMessageHistory
 from langfuse import observe, get_client
 from langfuse.langchain import CallbackHandler
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams
+from redis import Redis
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
 
 session_name = f"session-{uuid.uuid4().hex[:8]}"
 user_id = f"user-{uuid.uuid4().hex[:8]}"
+
+#Initialize redis client
+_redis_client: Redis = Redis.from_url(os.getenv("REDIS_CONNECTION_STRING"))
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
 llm = ChatOpenAI(
@@ -60,7 +67,8 @@ def embed_documents(json_path: str):
     langfuse_client.update_current_trace(user_id=user_id, session_id=session_name)
 
     try:
-        with open(json_path, "r") as f:
+        path = Path(json_path)
+        with open(path, "r") as f:
             data = json.load(f)
     except FileNotFoundError:
         print(f"Error: The file {json_path} was not found.")
@@ -146,6 +154,9 @@ def smartphone_info_tool(model: str) -> str:
     """
 
     product_db = embed_documents("datasets/smartphones.json")
+    if isinstance(product_db, list):
+        return f"Error: Vector store could not be initialized (received {product_db})."
+
     try:
         results = product_db.similarity_search(model, k=1)
         if not results:
@@ -161,7 +172,7 @@ def smartphone_info_tool(model: str) -> str:
 # Tool Call Handling and Response Generation
 # ---------------------------
 @observe(name="generate-context")
-def generate_context(ai_message: AIMessage) -> dict:
+def generate_context(ai_message: AIMessage) -> list[BaseMessage]:
     """
     Process tool calls from the language model and collect their responses as ToolMessage objects.
 
@@ -174,12 +185,11 @@ def generate_context(ai_message: AIMessage) -> dict:
     # construct the conversation history with the AI message containing tool calls
     langfuse_client = get_client()
     langfuse_client.update_current_trace(user_id=user_id, session_id=session_name)
-
-    conversation.append(ai_message)
+    current_conversation: list[BaseMessage] = [ai_message]
 
     # Check if the AI message has any tool calls
     if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
-        conversation.append(
+        current_conversation.append(
             AIMessage(
                 content="No tool calls found. Please ensure the model is configured to use tools."
             )
@@ -191,22 +201,32 @@ def generate_context(ai_message: AIMessage) -> dict:
         for tool_call in ai_message.tool_calls:
             if tool_call["name"] == "SmartphoneInfo":
                 tool_output = smartphone_info_tool.invoke(tool_call)
-                conversation.append(tool_output)
+                current_conversation.append(ToolMessage(tool_output))
 
     except Exception as e:
         print(f"An error occurred while processing tool calls: {e}")
-        conversation.append(
+        current_conversation.append(
             AIMessage(
                 content=f"An error occurred while processing tool calls: {e}"
             )
         )
+    finally:
+        return current_conversation
+
+
+def get_redis_history(session_id: str) -> BaseChatMessageHistory:
+    return RedisChatMessageHistory(
+        session_id=session_id,
+        redis_client=_redis_client,
+        ttl=os.getenv("REDIS_TTL_S")
+    )
 
 
 # ---------------------------
 # Main Conversation Loop
 # ---------------------------
 @observe(name="main-loop")
-def main():
+def main() -> None:
     langfuse_client = get_client()
     langfuse_client.update_current_trace(user_id=user_id, session_id=session_name)
 
@@ -216,40 +236,6 @@ def main():
     # Bind the tools to the language model instance
     llm_with_tools = llm.bind_tools(tools)
 
-    # context_system_prompt = """
-    #     You're part of a smartphone recommendation system. You work is to use the SmartphoneInfo tool to retrieve information about smartphones based on user queries.
-    #       - If the user requests specs/comparisons/recommendations for a model explicitly mentioned in chat or can be inferred from the conversation history, call SmartphoneInfo(model)
-    #       - If multiple models are mentioned or from the conversation history, you must call SmartphoneInfo for each model separately.
-    #       - If the user asks a general question, do nothing.
-    #     Do not guess or recommend a model from internal knowledge; the model name must be clear from the chat history or user input.
-    #
-    #     Current question: {user_input}
-    # """
-
-    # review_system_prompt = """
-    #     You are an expert AI assistant helping customers pick the best smartphone from our catalog. Follow these rules strictly:
-    #
-    #     1. Focus solely on concise (under 100 words), human-like, personalized reviews/comparisons of models named in the user’s query or provided context.
-    #     2. Think step by step before answering.
-    #     3. Never guess or recommend any model not explicitly mentioned in the context or query.
-    #     4. If no model is given, ask the user to check our online catalog for the exact model name.
-    #     5. DO NOT assist with ordering, returns, tracking, or other general support.
-    #     6. If asked about anything outside smartphone features/comparisons, respond that you can’t help.
-    #     7. If the user only wants to chat, engage briefly, but always steer back to smartphone comparisons.
-    #     8. Never list smartphone specifications, but instead explain how they translate to real-world benefits.
-    #
-    #     When recommending, evaluate performance, display, battery, camera, and special functions (e.g., 5G, fast charging, expandable storage), and how they translate to real-world benefits.
-    #     Always confirm the user’s needs before finalizing.
-    #
-    #     Current user: {user_id}
-    #     Current question: {user_input}
-    # """
-
-    # goodbye_system_prompt = """
-    #     You have been helping the user: {user_id} with smartphone features and comparisons.
-    #     Generate a short friendly goodbye message for the user and also thank them for their feedback.
-    #     (note that you've already been helping the user with smartphone features and comparisons, so do not repeat that or greet them again)
-    # """
 
     context_system_prompt = langfuse_client.get_prompt("context_system_prompt", label="latest")
     review_system_prompt = langfuse_client.get_prompt("review_system_prompt", label="latest")
@@ -282,8 +268,32 @@ def main():
 
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_system_prompt}
 
-    context_chain = context_prompt | llm_with_tools | generate_context
+    trimmer = trim_messages(
+        strategy="last",  # keep either the last or first messages
+        token_counter=llm,  # use your LLM to count tokens or create a special function
+        max_tokens=500,  # the maximum number of tokens
+        start_on="human",  # the first message type in the trimmed history
+        end_on=("human", "tool"),  # the last message type in the trimmed history
+        include_system=True,  # always include the system message
+    )
+
+    context_chain = context_prompt | trimmer | llm_with_tools | generate_context
+
+    context_chain_with_history = RunnableWithMessageHistory(
+        runnable=context_chain,
+        get_session_history=get_redis_history,
+        input_messages_key="user_input",
+        history_messages_key="conversation"
+    )
+
     review_chain = review_prompt | llm
+
+    review_chain_with_history = RunnableWithMessageHistory(
+        runnable=review_chain,
+        get_session_history=get_redis_history,
+        input_messages_key="user_input",
+        history_messages_key="conversation"
+    )
 
     goodbye_chain = goodbye_prompt | llm
 
@@ -328,11 +338,11 @@ def main():
                 print(f"System: {goodbye_message.content}")
                 break
 
-            conversation.append(HumanMessage(user_input))
+            #conversation.append(HumanMessage(user_input))
 
-            context_chain.invoke({"user_input": user_input,
-                                  "conversation": conversation},
+            context_chain_with_history.invoke({"user_input": user_input},
                                 config=RunnableConfig(
+                                       configurable={"session_id": session_name},
                                        run_name="context",
                                        callbacks=[langfuse_handler],
                                        metadata={
@@ -341,8 +351,9 @@ def main():
                                        }
                                    ))
 
-            response = review_chain.invoke({"user_id": user_id, "user_input": user_input, "conversation": conversation},
+            response = review_chain_with_history.invoke({"user_id": user_id, "user_input": user_input},
                                config=RunnableConfig(
+                                   configurable={"session_id": session_name},
                                    run_name="final-response",
                                    callbacks=[langfuse_handler],
                                    metadata={
@@ -352,7 +363,7 @@ def main():
                                ))
 
             print(f"System: {response.content}")
-            conversation.append(response)
+            #conversation.append(response)
 
     except Exception as e:
         print(f"An unexpected error occurred in the main loop: {e}")
