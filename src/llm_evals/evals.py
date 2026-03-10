@@ -6,7 +6,7 @@ from pathlib import Path
 
 import dotenv
 from langchain_community.docstore.document import Document
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage, trim_messages
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage, ToolCall, trim_messages
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
 from langchain_core.runnables.history import RunnableWithMessageHistory
@@ -129,7 +129,6 @@ def embed_documents(json_path: str):
                 embedding=embeddings_model,
                 collection_name=collection_name,
             )
-
             return qdrant_store
 
     except Exception as e:
@@ -141,31 +140,30 @@ def embed_documents(json_path: str):
 # Tool Definitions
 # ---------------------------
 @tool("SmartphoneInfo")
-def smartphone_info_tool(model: str) -> str:
+def smartphone_info_tool(model: str, tool_call_id: str) -> ToolMessage:
     """
-    Retrieves information about a smartphone model from the product database.
-
-    :param
-        model (str): The smartphone model to search for.
-
-    :returns
-        str: The smartphone's specifications, price, and availability,
-             or an error message if not found or if an error occurs.
+    Retrieves information about a smartphone model and returns a ToolMessage.
     """
-
     product_db = embed_documents("datasets/smartphones.json")
+
     if isinstance(product_db, list):
-        return f"Error: Vector store could not be initialized (received {product_db})."
+        content = f"Error: Vector store could not be initialized."
+        return ToolMessage(content=content, tool_call_id=tool_call_id)
 
     try:
         results = product_db.similarity_search(model, k=1)
         if not results:
-            print(f"Info: No results found for model: {model}")
-            return "Could not find information for the specified model."
-        info = results[0].page_content
-        return info
+            content = "Could not find information for the specified model."
+        else:
+            content = results[0].page_content
+
+        return ToolMessage(content=content, tool_call_id=tool_call_id)
+
     except Exception as e:
-        return f"Error during smartphone information retrieval for model {model}: {e}"
+        return ToolMessage(
+            content=f"Error during retrieval: {e}",
+            tool_call_id=tool_call_id
+        )
 
 
 # ---------------------------
@@ -185,15 +183,14 @@ def generate_context(ai_message: AIMessage) -> list[BaseMessage]:
     # construct the conversation history with the AI message containing tool calls
     langfuse_client = get_client()
     langfuse_client.update_current_trace(user_id=user_id, session_id=session_name)
-    current_conversation: list[BaseMessage] = [ai_message]
+    current_conversation: list[BaseMessage] = []
 
     # Check if the AI message has any tool calls
     if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
-        current_conversation.append(
-            AIMessage(
-                content="No tool calls found. Please ensure the model is configured to use tools."
-            )
-        )
+        current_conversation.append(ai_message)
+        return current_conversation
+    else:
+        current_conversation.append(ai_message)
 
     try:
         # Process each tool call, invoke the appropriate tool, and append the result to the conversation
@@ -201,17 +198,22 @@ def generate_context(ai_message: AIMessage) -> list[BaseMessage]:
         for tool_call in ai_message.tool_calls:
             if tool_call["name"] == "SmartphoneInfo":
                 tool_output = smartphone_info_tool.invoke(tool_call)
-                current_conversation.append(ToolMessage(tool_output))
+                current_conversation.append(tool_output)
 
     except Exception as e:
         print(f"An error occurred while processing tool calls: {e}")
-        current_conversation.append(
-            AIMessage(
-                content=f"An error occurred while processing tool calls: {e}"
-            )
-        )
+        for tool_call in ai_message.tool_calls:
+        # Check if this tool_call was already answered successfully before the crash
+            if not any(isinstance(m, ToolMessage) and m.tool_call_id == tool_call["id"] for m in current_conversation):
+                current_conversation.append(
+                    ToolMessage(
+                        content=f"Error processing tool: {e}",
+                        tool_call_id=tool_call["id"]
+                    )
+                )
     finally:
         return current_conversation
+
 
 
 def get_redis_history(session_id: str) -> BaseChatMessageHistory:
@@ -273,7 +275,7 @@ def main() -> None:
         token_counter=llm,  # use your LLM to count tokens or create a special function
         max_tokens=500,  # the maximum number of tokens
         start_on="human",  # the first message type in the trimmed history
-        end_on=("human", "tool"),  # the last message type in the trimmed history
+        end_on=("human", "tool"),
         include_system=True,  # always include the system message
     )
 
@@ -286,7 +288,9 @@ def main() -> None:
         history_messages_key="conversation"
     )
 
-    review_chain = review_prompt | llm
+    # Including trimmer here overcomes the {'error': {'message': "Invalid parameter: messages with role 'tool' must be a response to a preceeding message with 'tool_calls'.", 'type': 'invalid_request_error', 'param': 'messages.[4].role', 'code': None}} error
+    # from the OpenAI API
+    review_chain = review_prompt | trimmer | llm
 
     review_chain_with_history = RunnableWithMessageHistory(
         runnable=review_chain,
