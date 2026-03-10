@@ -2,9 +2,12 @@ import json
 import os
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import dotenv
+from ulid import ULID
 from langchain_community.docstore.document import Document
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage, ToolCall, trim_messages
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
@@ -197,7 +200,12 @@ def generate_context(ai_message: AIMessage) -> list[BaseMessage]:
         # a message with tool calls is expected to be followed by tool responses
         for tool_call in ai_message.tool_calls:
             if tool_call["name"] == "SmartphoneInfo":
-                tool_output = smartphone_info_tool.invoke(tool_call)
+                # LangChain tool's .invoke(tool_call) passes the 'args' dict to the function
+                # We need to manually pass tool_call_id if it's a separate parameter
+                tool_output: ToolMessage = smartphone_info_tool.invoke({
+                    "model": tool_call["args"]["model"],
+                    "tool_call_id": tool_call["id"]
+                })
                 current_conversation.append(tool_output)
 
     except Exception as e:
@@ -217,11 +225,52 @@ def generate_context(ai_message: AIMessage) -> list[BaseMessage]:
 
 
 def get_redis_history(session_id: str) -> BaseChatMessageHistory:
-    return RedisChatMessageHistory(
+    return ImprovedRedisChatMessageHistory(
         session_id=session_id,
         redis_client=_redis_client,
         ttl=os.getenv("REDIS_TTL_S")
     )
+
+
+class ImprovedRedisChatMessageHistory(RedisChatMessageHistory):
+    def add_message(self, message: BaseMessage) -> None:
+        if message is None:
+            raise ValueError("Message cannot be None")
+
+        timestamp = datetime.now().timestamp()
+        message_id = str(ULID())
+
+        data = {
+            "content": message.content,
+            "additional_kwargs": message.additional_kwargs,
+            "type": message.type,
+        }
+
+        if isinstance(message, AIMessage):
+            if message.tool_calls:
+                data["tool_calls"] = message.tool_calls
+            if message.invalid_tool_calls:
+                data["invalid_tool_calls"] = message.invalid_tool_calls
+            if message.usage_metadata:
+                data["usage_metadata"] = message.usage_metadata
+
+        common_data_to_store: Dict[str, Any] = {
+            "type": message.type,
+            "message_id": message_id,
+            "data": data,
+            "session_id": self.session_id,
+            "timestamp": timestamp,
+        }
+
+        if isinstance(message, ToolMessage):
+            common_data_to_store["data"]["tool_call_id"] = message.tool_call_id
+            common_data_to_store["data"]["status"] = message.status
+
+        self.index.load(
+            data=[common_data_to_store],
+            keys=[self._message_key(message_id)],
+            ttl=self.ttl,
+        )
 
 
 # ---------------------------
@@ -288,8 +337,6 @@ def main() -> None:
         history_messages_key="conversation"
     )
 
-    # Including trimmer here overcomes the {'error': {'message': "Invalid parameter: messages with role 'tool' must be a response to a preceeding message with 'tool_calls'.", 'type': 'invalid_request_error', 'param': 'messages.[4].role', 'code': None}} error
-    # from the OpenAI API
     review_chain = review_prompt | trimmer | llm
 
     review_chain_with_history = RunnableWithMessageHistory(
