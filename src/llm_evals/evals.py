@@ -4,14 +4,14 @@ import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 import dotenv
-from ulid import ULID
 from langchain_community.docstore.document import Document
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage, ToolCall, trim_messages
+from langchain_core.globals import set_debug
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage, trim_messages
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
-from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables import RunnableConfig, RunnablePassthrough
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -20,12 +20,17 @@ from langchain_redis import RedisChatMessageHistory
 from langchain_redis.chat_message_history import BaseChatMessageHistory
 from langfuse import observe, get_client
 from langfuse.langchain import CallbackHandler
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from redis import Redis
+from ulid import ULID
 
 # Load environment variables from .env file
-dotenv.load_dotenv()
+_ = dotenv.load_dotenv()
+
+set_debug(True)
 
 session_name = f"session-{uuid.uuid4().hex[:8]}"
 user_id = f"user-{uuid.uuid4().hex[:8]}"
@@ -51,6 +56,13 @@ conversation = []
 
 #Initialize Callbackhandler
 langfuse_handler = CallbackHandler()
+
+#Initialize Nemo config
+# Get the directory of the current file
+BASE_DIR = Path(__file__).resolve().parent
+config_path: Path = BASE_DIR / ".." / "config"
+rails_config = RailsConfig.from_path(str(config_path))
+
 
 # ---------------------------
 # Load JSON Data and Build Qdrant Vector Store
@@ -292,6 +304,8 @@ def main() -> None:
     review_system_prompt = langfuse_client.get_prompt("review_system_prompt", label="latest")
     goodbye_system_prompt = langfuse_client.get_prompt("goodbye_system_prompt", label="latest")
 
+    rails = RunnableRails(rails_config, input_key="user_input")
+
     context_prompt = ChatPromptTemplate.from_messages(
         [
             context_system_prompt.get_langchain_prompt()[0],
@@ -328,6 +342,8 @@ def main() -> None:
         include_system=True,  # always include the system message
     )
 
+
+
     context_chain = context_prompt | trimmer | llm_with_tools | generate_context
 
     context_chain_with_history = RunnableWithMessageHistory(
@@ -337,6 +353,8 @@ def main() -> None:
         history_messages_key="conversation"
     )
 
+    context_chain_with_rails = (RunnablePassthrough.assign(output=rails) | context_chain_with_history)
+
     review_chain = review_prompt | trimmer | llm
 
     review_chain_with_history = RunnableWithMessageHistory(
@@ -345,6 +363,8 @@ def main() -> None:
         input_messages_key="user_input",
         history_messages_key="conversation"
     )
+
+    review_chain_with_rails = (RunnablePassthrough.assign(output=rails) | review_chain_with_history)
 
     goodbye_chain = goodbye_prompt | llm
 
@@ -389,9 +409,7 @@ def main() -> None:
                 print(f"System: {goodbye_message.content}")
                 break
 
-            #conversation.append(HumanMessage(user_input))
-
-            context_chain_with_history.invoke({"user_input": user_input},
+            context_chain_with_rails.invoke({"user_input": user_input},
                                 config=RunnableConfig(
                                        configurable={"session_id": session_name},
                                        run_name="context",
@@ -402,7 +420,7 @@ def main() -> None:
                                        }
                                    ))
 
-            response = review_chain_with_history.invoke({"user_id": user_id, "user_input": user_input},
+            response = review_chain_with_rails.invoke({"user_id": user_id, "user_input": user_input},
                                config=RunnableConfig(
                                    configurable={"session_id": session_name},
                                    run_name="final-response",
@@ -414,7 +432,6 @@ def main() -> None:
                                ))
 
             print(f"System: {response.content}")
-            #conversation.append(response)
 
     except Exception as e:
         print(f"An unexpected error occurred in the main loop: {e}")
