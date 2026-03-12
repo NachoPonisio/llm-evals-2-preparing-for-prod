@@ -30,7 +30,7 @@ from ulid import ULID
 # Load environment variables from .env file
 _ = dotenv.load_dotenv()
 
-set_debug(False)
+set_debug(True)
 
 session_name = f"session-{uuid.uuid4().hex[:8]}"
 user_id = f"user-{uuid.uuid4().hex[:8]}"
