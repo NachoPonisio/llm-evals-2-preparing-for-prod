@@ -39,15 +39,29 @@ user_id = f"user-{uuid.uuid4().hex[:8]}"
 _redis_client: Redis = Redis.from_url(os.getenv("REDIS_CONNECTION_STRING"))
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
+# llm = ChatOpenAI(
+#     model=os.getenv("OPENAI_MODEL"),
+#     api_key=os.getenv("OPENAI_API_KEY")
+# )
+
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    api_key=os.getenv("OPENAI_API_KEY")
+    model=os.getenv("LITELLM_MODEL"),
+    base_url=os.getenv("LITELLM_BASEURL"),
+    api_key=os.getenv("LITELLM_API_KEY"),
+    model_kwargs={"user": "default_user"}
 )
 
 # Initialize the embeddings model with OpenAI API credentials
+# embeddings_model = OpenAIEmbeddings(
+#     model="text-embedding-ada-002",
+#     api_key=os.getenv("OPENAI_API_KEY"),
+#     show_progress_bar=True,
+# )
+
 embeddings_model = OpenAIEmbeddings(
-    model="text-embedding-ada-002",
-    api_key=os.getenv("OPENAI_API_KEY"),
+    model="openai-text-embedding-ada-002",
+    api_key=os.getenv("LITELLM_API_KEY"),
+    base_url=os.getenv("LITELLM_BASEURL"),
     show_progress_bar=True,
 )
 
@@ -62,6 +76,7 @@ langfuse_handler = CallbackHandler()
 BASE_DIR = Path(__file__).resolve().parent
 config_path: Path = BASE_DIR / ".." / "config"
 rails_config = RailsConfig.from_path(str(config_path))
+
 
 
 # ---------------------------
@@ -304,7 +319,7 @@ def main() -> None:
     review_system_prompt = langfuse_client.get_prompt("review_system_prompt", label="latest")
     goodbye_system_prompt = langfuse_client.get_prompt("goodbye_system_prompt", label="latest")
 
-    rails = RunnableRails(rails_config, input_key="user_input")
+    rails = RunnableRails(rails_config, input_key="user_input", llm=llm)
 
     context_prompt = ChatPromptTemplate.from_messages(
         [
@@ -333,9 +348,15 @@ def main() -> None:
 
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_system_prompt}
 
+    token_llm = ChatOpenAI(
+        model=llm.model_name.replace("openai-", ""),  # Use a name LangChain understands for counting
+        base_url=os.getenv("LITELLM_BASEURL"),
+        api_key=os.getenv("LITELLM_API_KEY")
+    )
+
     trimmer = trim_messages(
         strategy="last",  # keep either the last or first messages
-        token_counter=llm,  # use your LLM to count tokens or create a special function
+        token_counter=token_llm,  # use your LLM to count tokens or create a special function
         max_tokens=500,  # the maximum number of tokens
         start_on="human",  # the first message type in the trimmed history
         end_on=("human", "tool"),
