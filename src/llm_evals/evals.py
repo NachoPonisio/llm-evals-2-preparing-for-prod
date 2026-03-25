@@ -65,9 +65,6 @@ embeddings_model = OpenAIEmbeddings(
     show_progress_bar=True,
 )
 
-# Initialize conversation history
-conversation = []
-
 #Initialize Callbackhandler
 langfuse_handler = CallbackHandler()
 
@@ -430,8 +427,8 @@ def main() -> None:
                 print(f"System: {goodbye_message.content}")
                 break
 
-            context_chain_with_rails.invoke({"user_input": user_input},
-                                config=RunnableConfig(
+            _ : List[BaseMessage] = context_chain_with_rails.invoke({"user_input": user_input},
+                              config=RunnableConfig(
                                        configurable={"session_id": session_name},
                                        run_name="context",
                                        callbacks=[langfuse_handler],
