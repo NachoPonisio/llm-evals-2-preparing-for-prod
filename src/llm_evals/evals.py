@@ -4,14 +4,25 @@ import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
+
 from typing import Any, Dict
 
+from typing import Any, Dict, List, Optional
+
+
 import dotenv
+from ulid import ULID
 from langchain_community.docstore.document import Document
+
 from langchain_core.globals import set_debug
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage, trim_messages
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig, RunnablePassthrough
+
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage, ToolCall, trim_messages
+from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
+from langchain_core.runnables import RunnableConfig, RunnableLambda, RunnablePassthrough, Runnable
+
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -20,12 +31,17 @@ from langchain_redis import RedisChatMessageHistory
 from langchain_redis.chat_message_history import BaseChatMessageHistory
 from langfuse import observe, get_client
 from langfuse.langchain import CallbackHandler
+
 from nemoguardrails import RailsConfig
 from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from redis import Redis
 from ulid import ULID
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams
+from redis import Redis
+
 
 # Load environment variables from .env file
 _ = dotenv.load_dotenv()
@@ -35,7 +51,6 @@ set_debug(True)
 session_name = f"session-{uuid.uuid4().hex[:8]}"
 user_id = f"user-{uuid.uuid4().hex[:8]}"
 
-#Initialize redis client
 _redis_client: Redis = Redis.from_url(os.getenv("REDIS_CONNECTION_STRING"))
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
@@ -46,15 +61,15 @@ llm = ChatOpenAI(
 
 # Initialize the embeddings model with OpenAI API credentials
 embeddings_model = OpenAIEmbeddings(
-    model="text-embedding-ada-002",
+    model=os.getenv("OPENAI_EMBEDDING_MODEL"),
     api_key=os.getenv("OPENAI_API_KEY"),
-    show_progress_bar=True,
+    show_progress_bar=False,
 )
 
 # Initialize conversation history
-conversation = []
+chat_history: RedisChatMessageHistory = None
 
-#Initialize Callbackhandler
+# Initialize Callbackhandler
 langfuse_handler = CallbackHandler()
 
 #Initialize Nemo config
@@ -116,7 +131,7 @@ def embed_documents(json_path: str):
 
     try:
         collection_name = "smartphones"
-        qdrant_client = QdrantClient("http://localhost:6333")
+        qdrant_client = QdrantClient(os.getenv("QDRANT_CONNECTION_URL"))
 
         collection_exists = qdrant_client.collection_exists(collection_name=collection_name)
         if not collection_exists:
@@ -223,7 +238,7 @@ def generate_context(ai_message: AIMessage) -> list[BaseMessage]:
     except Exception as e:
         print(f"An error occurred while processing tool calls: {e}")
         for tool_call in ai_message.tool_calls:
-        # Check if this tool_call was already answered successfully before the crash
+
             if not any(isinstance(m, ToolMessage) and m.tool_call_id == tool_call["id"] for m in current_conversation):
                 current_conversation.append(
                     ToolMessage(
@@ -236,53 +251,20 @@ def generate_context(ai_message: AIMessage) -> list[BaseMessage]:
 
 
 
+
 def get_redis_history(session_id: str) -> BaseChatMessageHistory:
-    return ImprovedRedisChatMessageHistory(
+    return RedisChatMessageHistory(
         session_id=session_id,
         redis_client=_redis_client,
         ttl=os.getenv("REDIS_TTL_S")
     )
 
 
-class ImprovedRedisChatMessageHistory(RedisChatMessageHistory):
-    def add_message(self, message: BaseMessage) -> None:
-        if message is None:
-            raise ValueError("Message cannot be None")
+def get_clean_history():
+    # Only keep Human and AI messages
+    global chat_history
+    return [m for m in chat_history.messages if isinstance(m, (HumanMessage, AIMessage))]
 
-        timestamp = datetime.now().timestamp()
-        message_id = str(ULID())
-
-        data = {
-            "content": message.content,
-            "additional_kwargs": message.additional_kwargs,
-            "type": message.type,
-        }
-
-        if isinstance(message, AIMessage):
-            if message.tool_calls:
-                data["tool_calls"] = message.tool_calls
-            if message.invalid_tool_calls:
-                data["invalid_tool_calls"] = message.invalid_tool_calls
-            if message.usage_metadata:
-                data["usage_metadata"] = message.usage_metadata
-
-        common_data_to_store: Dict[str, Any] = {
-            "type": message.type,
-            "message_id": message_id,
-            "data": data,
-            "session_id": self.session_id,
-            "timestamp": timestamp,
-        }
-
-        if isinstance(message, ToolMessage):
-            common_data_to_store["data"]["tool_call_id"] = message.tool_call_id
-            common_data_to_store["data"]["status"] = message.status
-
-        self.index.load(
-            data=[common_data_to_store],
-            keys=[self._message_key(message_id)],
-            ttl=self.ttl,
-        )
 
 
 # ---------------------------
@@ -290,6 +272,9 @@ class ImprovedRedisChatMessageHistory(RedisChatMessageHistory):
 # ---------------------------
 @observe(name="main-loop")
 def main() -> None:
+
+    global chat_history
+
     langfuse_client = get_client()
     langfuse_client.update_current_trace(user_id=user_id, session_id=session_name)
 
@@ -299,6 +284,7 @@ def main() -> None:
     # Bind the tools to the language model instance
     llm_with_tools = llm.bind_tools(tools)
 
+    chat_history = get_redis_history(session_name)
 
     context_system_prompt = langfuse_client.get_prompt("context_system_prompt", label="latest")
     review_system_prompt = langfuse_client.get_prompt("review_system_prompt", label="latest")
@@ -309,9 +295,8 @@ def main() -> None:
     context_prompt = ChatPromptTemplate.from_messages(
         [
             context_system_prompt.get_langchain_prompt()[0],
-            MessagesPlaceholder(variable_name="conversation"),
-            context_system_prompt.get_langchain_prompt()[1]
-
+            context_system_prompt.get_langchain_prompt()[1],
+            MessagesPlaceholder(variable_name="conversation")
         ]
     )
 
@@ -328,12 +313,12 @@ def main() -> None:
     review_prompt.metadata = {"langfuse_prompt": review_system_prompt}
 
     goodbye_prompt = ChatPromptTemplate.from_messages(
-            goodbye_system_prompt.get_langchain_prompt()[0]
+        goodbye_system_prompt.get_langchain_prompt()[0]
     )
 
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_system_prompt}
 
-    trimmer = trim_messages(
+    trimmer: Runnable = trim_messages(
         strategy="last",  # keep either the last or first messages
         token_counter=llm,  # use your LLM to count tokens or create a special function
         max_tokens=500,  # the maximum number of tokens
@@ -366,28 +351,35 @@ def main() -> None:
 
     review_chain_with_rails = (RunnablePassthrough.assign(output=rails) | review_chain_with_history)
 
+
+    context_chain = context_prompt | llm_with_tools | RunnableLambda(generate_context)
+
+    review_chain = review_prompt | llm
+
+
     goodbye_chain = goodbye_prompt | llm
 
     try:
         print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
         while True:
-            user_input = input("User: ").strip()
+            user_input = input(f"User @ {session_name}: ").strip()
             if user_input.lower() in ["exit", "quit", "bye", "end"]:
                 goodbye_message = goodbye_chain.invoke(
-                   input={"user_id": user_id},
-                   config=RunnableConfig(
-                       run_name="goodbye-message",
-                       callbacks=[langfuse_handler],
-                       metadata={
-                           "langfuse_session_id": session_name,
-                           "langfuse_user_id": user_id,
-                       }
-                   ))
+                    input={"user_id": user_id},
+                    config=RunnableConfig(
+                        run_name="goodbye-message",
+                        callbacks=[langfuse_handler],
+                        metadata={
+                            "langfuse_session_id": session_name,
+                            "langfuse_user_id": user_id,
+                        }
+                    ))
                 current_trace = langfuse_client.get_current_trace_id()
                 print("-*" * 20)
                 user_score: int = 0
                 try:
-                    user_score = int(input(f"> How would you rate the relevance of my responses for trace_id {current_trace} (0-10)?: ").strip())
+                    user_score = int(input(
+                        f"> How would you rate the relevance of my responses for trace_id {current_trace} (0-10)?: ").strip())
                 except Exception as e:
                     print("Unable to capture score")
 
@@ -398,16 +390,16 @@ def main() -> None:
                     print("Unable to capture comments")
                 print("-*" * 20)
 
-
                 langfuse_client.score_current_trace(
                     name="relevance",
-                    value=user_score/10,
+                    value=user_score / 10,
                     data_type="NUMERIC",
                     comment=user_comments
                 )
 
-                print(f"System: {goodbye_message.content}")
+                print(f"System @ {session_name}: {goodbye_message.content}")
                 break
+
 
             context_chain_with_rails.invoke({"user_input": user_input},
                                 config=RunnableConfig(
@@ -433,11 +425,42 @@ def main() -> None:
 
             print(f"System: {response.content}")
 
+            chat_history.add_message(HumanMessage(user_input))
+
+            trimmed_messages = trimmer.invoke(get_clean_history())
+
+            context_chain.invoke(
+                input={"user_input": user_input, "conversation": trimmed_messages},
+                config=RunnableConfig(
+                    configurable={"session_id": session_name},
+                    run_name="context",
+                    callbacks=[langfuse_handler],
+                    metadata={
+                        "langfuse_session_id": session_name,
+                        "langfuse_user_id": user_id,
+                    }
+                )
+            )
+
+            response = review_chain.invoke(
+                input={"user_id": user_id, "user_input": user_input, "conversation": get_clean_history()},
+                config=RunnableConfig(
+                    configurable={"session_id": session_name},
+                    run_name="final-response",
+                    callbacks=[langfuse_handler],
+                    metadata={
+                        "langfuse_session_id": session_name,
+                        "langfuse_user_id": user_id,
+                    }
+                ))
+
+            print(f"System @ {session_name}: {response.content}")
+
+
     except Exception as e:
-        print(f"An unexpected error occurred in the main loop: {e}")
+        print(f"ERROR: An unexpected error occurred in the main loop: {e}")
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-
