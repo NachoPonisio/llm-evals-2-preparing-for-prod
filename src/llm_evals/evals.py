@@ -2,28 +2,14 @@ import json
 import os
 import sys
 import uuid
-from datetime import datetime
 from pathlib import Path
 
-from typing import Any, Dict
-
-from typing import Any, Dict, List, Optional
-
-
 import dotenv
-from ulid import ULID
 from langchain_community.docstore.document import Document
-
 from langchain_core.globals import set_debug
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage, trim_messages
-from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
-from langchain_core.runnables import RunnableConfig, RunnablePassthrough
-
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage, ToolCall, trim_messages
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage, trim_messages
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig, RunnableLambda, RunnablePassthrough, Runnable
-
-from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
@@ -31,21 +17,17 @@ from langchain_redis import RedisChatMessageHistory
 from langchain_redis.chat_message_history import BaseChatMessageHistory
 from langfuse import observe, get_client
 from langfuse.langchain import CallbackHandler
-
 from nemoguardrails import RailsConfig
 from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
+from nemoguardrails.logging.verbose import set_verbose
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from redis import Redis
-from ulid import ULID
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams
-from redis import Redis
-
 
 # Load environment variables from .env file
 _ = dotenv.load_dotenv()
 
+# set_verbose(True)
 set_debug(True)
 
 session_name = f"session-{uuid.uuid4().hex[:8]}"
@@ -72,7 +54,7 @@ chat_history: RedisChatMessageHistory = None
 # Initialize Callbackhandler
 langfuse_handler = CallbackHandler()
 
-#Initialize Nemo config
+# Initialize Nemo config
 # Get the directory of the current file
 BASE_DIR = Path(__file__).resolve().parent
 config_path: Path = BASE_DIR / ".." / "config"
@@ -250,8 +232,6 @@ def generate_context(ai_message: AIMessage) -> list[BaseMessage]:
         return current_conversation
 
 
-
-
 def get_redis_history(session_id: str) -> BaseChatMessageHistory:
     return RedisChatMessageHistory(
         session_id=session_id,
@@ -266,13 +246,11 @@ def get_clean_history():
     return [m for m in chat_history.messages if isinstance(m, (HumanMessage, AIMessage))]
 
 
-
 # ---------------------------
 # Main Conversation Loop
 # ---------------------------
 @observe(name="main-loop")
 def main() -> None:
-
     global chat_history
 
     langfuse_client = get_client()
@@ -327,35 +305,13 @@ def main() -> None:
         include_system=True,  # always include the system message
     )
 
-
-
-    context_chain = context_prompt | trimmer | llm_with_tools | generate_context
-
-    context_chain_with_history = RunnableWithMessageHistory(
-        runnable=context_chain,
-        get_session_history=get_redis_history,
-        input_messages_key="user_input",
-        history_messages_key="conversation"
-    )
-
-    context_chain_with_rails = (RunnablePassthrough.assign(output=rails) | context_chain_with_history)
-
-    review_chain = review_prompt | trimmer | llm
-
-    review_chain_with_history = RunnableWithMessageHistory(
-        runnable=review_chain,
-        get_session_history=get_redis_history,
-        input_messages_key="user_input",
-        history_messages_key="conversation"
-    )
-
-    review_chain_with_rails = (RunnablePassthrough.assign(output=rails) | review_chain_with_history)
-
-
     context_chain = context_prompt | llm_with_tools | RunnableLambda(generate_context)
+
+    context_chain_with_rails = (RunnablePassthrough.assign(output=rails) | context_chain)
 
     review_chain = review_prompt | llm
 
+    review_chain_with_rails = (RunnablePassthrough.assign(output=rails) | review_chain)
 
     goodbye_chain = goodbye_prompt | llm
 
@@ -375,6 +331,7 @@ def main() -> None:
                         }
                     ))
                 current_trace = langfuse_client.get_current_trace_id()
+
                 print("-*" * 20)
                 user_score: int = 0
                 try:
@@ -400,36 +357,11 @@ def main() -> None:
                 print(f"System @ {session_name}: {goodbye_message.content}")
                 break
 
-
-            context_chain_with_rails.invoke({"user_input": user_input},
-                                config=RunnableConfig(
-                                       configurable={"session_id": session_name},
-                                       run_name="context",
-                                       callbacks=[langfuse_handler],
-                                       metadata={
-                                           "langfuse_session_id": session_name,
-                                           "langfuse_user_id": user_id,
-                                       }
-                                   ))
-
-            response = review_chain_with_rails.invoke({"user_id": user_id, "user_input": user_input},
-                               config=RunnableConfig(
-                                   configurable={"session_id": session_name},
-                                   run_name="final-response",
-                                   callbacks=[langfuse_handler],
-                                   metadata={
-                                       "langfuse_session_id": session_name,
-                                       "langfuse_user_id": user_id,
-                                   }
-                               ))
-
-            print(f"System: {response.content}")
-
             chat_history.add_message(HumanMessage(user_input))
 
             trimmed_messages = trimmer.invoke(get_clean_history())
 
-            context_chain.invoke(
+            _ = context_chain_with_rails.invoke(
                 input={"user_input": user_input, "conversation": trimmed_messages},
                 config=RunnableConfig(
                     configurable={"session_id": session_name},
@@ -442,7 +374,7 @@ def main() -> None:
                 )
             )
 
-            response = review_chain.invoke(
+            response = review_chain_with_rails.invoke(
                 input={"user_id": user_id, "user_input": user_input, "conversation": get_clean_history()},
                 config=RunnableConfig(
                     configurable={"session_id": session_name},
@@ -455,7 +387,7 @@ def main() -> None:
                 ))
 
             print(f"System @ {session_name}: {response.content}")
-
+            print(rails.rails.explain())
 
     except Exception as e:
         print(f"ERROR: An unexpected error occurred in the main loop: {e}")
