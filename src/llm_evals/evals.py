@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sys
 import uuid
@@ -19,21 +20,27 @@ from langfuse import observe, get_client
 from langfuse.langchain import CallbackHandler
 from nemoguardrails import RailsConfig
 from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
-from nemoguardrails.logging.verbose import set_verbose
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
-from redis import Redis
+
+from llm_evals.utils import Color
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 _ = dotenv.load_dotenv()
 
 # set_verbose(True)
 set_debug(True)
+dotenv.load_dotenv()
 
 session_name = f"session-{uuid.uuid4().hex[:8]}"
 user_id = f"user-{uuid.uuid4().hex[:8]}"
 
-_redis_client: Redis = Redis.from_url(os.getenv("REDIS_CONNECTION_STRING"))
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
 llm = ChatOpenAI(
@@ -48,18 +55,23 @@ embeddings_model = OpenAIEmbeddings(
     show_progress_bar=False,
 )
 
-# Initialize conversation history
-chat_history: RedisChatMessageHistory = None
-
 # Initialize Callbackhandler
 langfuse_handler = CallbackHandler()
 
+vector_store = None
 # Initialize Nemo config
 # Get the directory of the current file
 BASE_DIR = Path(__file__).resolve().parent
 config_path: Path = BASE_DIR / ".." / "config"
 rails_config = RailsConfig.from_path(str(config_path))
 
+def get_vector_store():
+    global vector_store
+    if not vector_store:
+        logger.warning("Vector store not yet initialized, initializing...")
+        vector_store = embed_documents("datasets/smartphones.json")
+
+    return vector_store
 
 # ---------------------------
 # Load JSON Data and Build Qdrant Vector Store
@@ -83,13 +95,13 @@ def embed_documents(json_path: str):
         with open(path, "r") as f:
             data = json.load(f)
     except FileNotFoundError:
-        print(f"Error: The file {json_path} was not found.")
+        logger.error(f"Error: The file {json_path} was not found.")
         return []
     except json.JSONDecodeError as jde:
-        print(f"Error decoding JSON from file {json_path}: {jde}")
+        logger.error(f"Error decoding JSON from file {json_path}: {jde}")
         return []
     except Exception as e:
-        print(f"An unexpected error occurred while reading {json_path}: {e}")
+        logger.error(f"An unexpected error occurred while reading {json_path}: {e}")
         return []
 
     documents = []
@@ -117,6 +129,7 @@ def embed_documents(json_path: str):
 
         collection_exists = qdrant_client.collection_exists(collection_name=collection_name)
         if not collection_exists:
+            logger.warning("Nonexistent collection, creating and embedding...")
             qdrant_client.create_collection(
                 collection_name=collection_name,
                 vectors_config=VectorParams(
@@ -137,6 +150,7 @@ def embed_documents(json_path: str):
 
         # no need to create a vector store every time
         else:
+            logger.info("Collection found, fetching...")
             qdrant_store = QdrantVectorStore.from_existing_collection(
                 embedding=embeddings_model,
                 collection_name=collection_name,
@@ -144,7 +158,7 @@ def embed_documents(json_path: str):
             return qdrant_store
 
     except Exception as e:
-        print(f"Error initializing the vector store: {e}")
+        logger.error(f"Error initializing the vector store: {e}")
         return []
 
 
@@ -156,11 +170,11 @@ def smartphone_info_tool(model: str, tool_call_id: str) -> ToolMessage:
     """
     Retrieves information about a smartphone model and returns a ToolMessage.
     """
-    product_db = embed_documents("datasets/smartphones.json")
+    product_db = get_vector_store()
 
     if isinstance(product_db, list):
         content = f"Error: Vector store could not be initialized."
-        return ToolMessage(content=content, tool_call_id=tool_call_id)
+        return ToolMessage(content=content, tool_aicall_id=tool_call_id)
 
     try:
         results = product_db.similarity_search(model, k=1)
@@ -212,15 +226,16 @@ def generate_context(ai_message: AIMessage) -> list[BaseMessage]:
                 # LangChain tool's .invoke(tool_call) passes the 'args' dict to the function
                 # We need to manually pass tool_call_id if it's a separate parameter
                 tool_output: ToolMessage = smartphone_info_tool.invoke({
+                    "vector_store": get_vector_store(),
                     "model": tool_call["args"]["model"],
                     "tool_call_id": tool_call["id"]
                 })
                 current_conversation.append(tool_output)
 
     except Exception as e:
-        print(f"An error occurred while processing tool calls: {e}")
+        logger.error(f"An error occurred while processing tool calls: {e}")
         for tool_call in ai_message.tool_calls:
-
+            # Check if this tool_call was already answered successfully before the crash
             if not any(isinstance(m, ToolMessage) and m.tool_call_id == tool_call["id"] for m in current_conversation):
                 current_conversation.append(
                     ToolMessage(
@@ -232,18 +247,17 @@ def generate_context(ai_message: AIMessage) -> list[BaseMessage]:
         return current_conversation
 
 
+
 def get_redis_history(session_id: str) -> BaseChatMessageHistory:
     return RedisChatMessageHistory(
         session_id=session_id,
-        redis_client=_redis_client,
+        redis_url=os.getenv("REDIS_CONNECTION_STRING"),
         ttl=os.getenv("REDIS_TTL_S")
     )
 
 
-def get_clean_history():
-    # Only keep Human and AI messages
-    global chat_history
-    return [m for m in chat_history.messages if isinstance(m, (HumanMessage, AIMessage))]
+def get_clean_history(chat_hist: BaseChatMessageHistory):
+    return [m for m in chat_hist.messages if isinstance(m, (HumanMessage, AIMessage))]
 
 
 # ---------------------------
@@ -251,7 +265,6 @@ def get_clean_history():
 # ---------------------------
 @observe(name="main-loop")
 def main() -> None:
-    global chat_history
 
     langfuse_client = get_client()
     langfuse_client.update_current_trace(user_id=user_id, session_id=session_name)
@@ -299,7 +312,7 @@ def main() -> None:
     trimmer: Runnable = trim_messages(
         strategy="last",  # keep either the last or first messages
         token_counter=llm,  # use your LLM to count tokens or create a special function
-        max_tokens=500,  # the maximum number of tokens
+        max_tokens=2000,  # the maximum number of tokens
         start_on="human",  # the first message type in the trimmed history
         end_on=("human", "tool"),
         include_system=True,  # always include the system message
@@ -316,9 +329,9 @@ def main() -> None:
     goodbye_chain = goodbye_prompt | llm
 
     try:
-        print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
+        print(f"{Color.CYAN}Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.{Color.RESET}")
         while True:
-            user_input = input(f"User @ {session_name}: ").strip()
+            user_input = input(f"{Color.GREEN}User @ {session_name}: {Color.RESET}").strip()
             if user_input.lower() in ["exit", "quit", "bye", "end"]:
                 goodbye_message = goodbye_chain.invoke(
                     input={"user_id": user_id},
@@ -331,21 +344,20 @@ def main() -> None:
                         }
                     ))
                 current_trace = langfuse_client.get_current_trace_id()
-
-                print("-*" * 20)
+                print(f"{Color.YELLOW}" + "-*" * 20 + f"{Color.RESET}")
                 user_score: int = 0
                 try:
                     user_score = int(input(
-                        f"> How would you rate the relevance of my responses for trace_id {current_trace} (0-10)?: ").strip())
+                        f"{Color.YELLOW}> How would you rate the relevance of my responses for trace_id {current_trace} (0-10)?:{Color.RESET} ").strip())
                 except Exception as e:
-                    print("Unable to capture score")
+                    logger.warning("Unable to capture score")
 
                 user_comments: str = ""
                 try:
-                    user_comments = input("> Would you like to add any comments?: ").strip()
+                    user_comments = input(f"{Color.YELLOW}> Would you like to add any comments?:{Color.RESET} ").strip()
                 except Exception as e:
-                    print("Unable to capture comments")
-                print("-*" * 20)
+                    logger.warning("Unable to capture comments")
+                print(f"{Color.YELLOW}" + "-*" * 20 + f"{Color.RESET}")
 
                 langfuse_client.score_current_trace(
                     name="relevance",
@@ -354,12 +366,12 @@ def main() -> None:
                     comment=user_comments
                 )
 
-                print(f"System @ {session_name}: {goodbye_message.content}")
+                print(f"{Color.GRAY}System @ {session_name}: {goodbye_message.content}{Color.RESET}")
                 break
 
             chat_history.add_message(HumanMessage(user_input))
 
-            trimmed_messages = trimmer.invoke(get_clean_history())
+            trimmed_messages = trimmer.invoke(get_clean_history(chat_history))
 
             _ = context_chain_with_rails.invoke(
                 input={"user_input": user_input, "conversation": trimmed_messages},
@@ -386,6 +398,7 @@ def main() -> None:
                     }
                 ))
 
+            print(f"{Color.GRAY}System @ {session_name}: {response.content}{Color.RESET}")
             print(f"System @ {session_name}: {response.content}")
             print(rails.rails.explain())
 
