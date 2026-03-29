@@ -36,7 +36,6 @@ _ = dotenv.load_dotenv()
 
 # set_verbose(True)
 set_debug(True)
-dotenv.load_dotenv()
 
 session_name = f"session-{uuid.uuid4().hex[:8]}"
 user_id = f"user-{uuid.uuid4().hex[:8]}"
@@ -343,6 +342,7 @@ def main() -> None:
                             "langfuse_user_id": user_id,
                         }
                     ))
+
                 current_trace = langfuse_client.get_current_trace_id()
                 print(f"{Color.YELLOW}" + "-*" * 20 + f"{Color.RESET}")
                 user_score: int = 0
@@ -387,7 +387,7 @@ def main() -> None:
             )
 
             response = review_chain_with_rails.invoke(
-                input={"user_id": user_id, "user_input": user_input, "conversation": get_clean_history()},
+                input={"user_id": user_id, "user_input": user_input, "conversation": get_clean_history(chat_history)},
                 config=RunnableConfig(
                     configurable={"session_id": session_name},
                     run_name="final-response",
@@ -399,11 +399,9 @@ def main() -> None:
                 ))
 
             print(f"{Color.GRAY}System @ {session_name}: {response.content}{Color.RESET}")
-            print(f"System @ {session_name}: {response.content}")
-            print(rails.rails.explain())
 
     except Exception as e:
-        print(f"ERROR: An unexpected error occurred in the main loop: {e}")
+        logger.error(f"ERROR: An unexpected error occurred in the main loop: {e}")
         sys.exit(1)
 
 
