@@ -1,18 +1,16 @@
 import json
+import logging
 import os
 import sys
 import uuid
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from llm_evals.utils import Color
 
 import dotenv
 from langchain_community.docstore.document import Document
-from langchain_core.globals import set_debug
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage, trim_messages
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage, trim_messages
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
-from langchain_core.runnables import RunnableConfig, RunnablePassthrough
-from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.runnables import RunnableConfig, RunnableLambda, Runnable
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
@@ -20,64 +18,47 @@ from langchain_redis import RedisChatMessageHistory
 from langchain_redis.chat_message_history import BaseChatMessageHistory
 from langfuse import observe, get_client
 from langfuse.langchain import CallbackHandler
-from nemoguardrails import RailsConfig
-from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
-from redis import Redis
-from ulid import ULID
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
-_ = dotenv.load_dotenv()
-
-set_debug(True)
+dotenv.load_dotenv()
 
 session_name = f"session-{uuid.uuid4().hex[:8]}"
 user_id = f"user-{uuid.uuid4().hex[:8]}"
 
-#Initialize redis client
-_redis_client: Redis = Redis.from_url(os.getenv("REDIS_CONNECTION_STRING"))
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
-# llm = ChatOpenAI(
-#     model=os.getenv("OPENAI_MODEL"),
-#     api_key=os.getenv("OPENAI_API_KEY")
-# )
-
 llm = ChatOpenAI(
-    model=os.getenv("LITELLM_MODEL"),
-    base_url=os.getenv("LITELLM_BASEURL"),
-    api_key=os.getenv("LITELLM_API_KEY"),
-    model_kwargs={"user": "default_user"}
+    model=os.getenv("OPENAI_MODEL"),
+    api_key=os.getenv("OPENAI_API_KEY")
 )
 
 # Initialize the embeddings model with OpenAI API credentials
-# embeddings_model = OpenAIEmbeddings(
-#     model="text-embedding-ada-002",
-#     api_key=os.getenv("OPENAI_API_KEY"),
-#     show_progress_bar=True,
-# )
-
 embeddings_model = OpenAIEmbeddings(
-    model="openai-text-embedding-ada-002",
-    api_key=os.getenv("LITELLM_API_KEY"),
-    base_url=os.getenv("LITELLM_BASEURL"),
-    show_progress_bar=True,
+    model=os.getenv("OPENAI_EMBEDDING_MODEL"),
+    api_key=os.getenv("OPENAI_API_KEY"),
+    show_progress_bar=False,
 )
 
-# Initialize conversation history
-conversation = []
-
-#Initialize Callbackhandler
+# Initialize Callbackhandler
 langfuse_handler = CallbackHandler()
 
-#Initialize Nemo config
-# Get the directory of the current file
-BASE_DIR = Path(__file__).resolve().parent
-config_path: Path = BASE_DIR / ".." / "config"
-rails_config = RailsConfig.from_path(str(config_path))
+vector_store = None
 
+def get_vector_store():
+    global vector_store
+    if not vector_store:
+        logger.warning("Vector store not yet initialized, initializing...")
+        vector_store = embed_documents("datasets/smartphones.json")
 
+    return vector_store
 
 # ---------------------------
 # Load JSON Data and Build Qdrant Vector Store
@@ -101,13 +82,13 @@ def embed_documents(json_path: str):
         with open(path, "r") as f:
             data = json.load(f)
     except FileNotFoundError:
-        print(f"Error: The file {json_path} was not found.")
+        logger.error(f"Error: The file {json_path} was not found.")
         return []
     except json.JSONDecodeError as jde:
-        print(f"Error decoding JSON from file {json_path}: {jde}")
+        logger.error(f"Error decoding JSON from file {json_path}: {jde}")
         return []
     except Exception as e:
-        print(f"An unexpected error occurred while reading {json_path}: {e}")
+        logger.error(f"An unexpected error occurred while reading {json_path}: {e}")
         return []
 
     documents = []
@@ -131,10 +112,11 @@ def embed_documents(json_path: str):
 
     try:
         collection_name = "smartphones"
-        qdrant_client = QdrantClient("http://localhost:6333")
+        qdrant_client = QdrantClient(os.getenv("QDRANT_CONNECTION_URL"))
 
         collection_exists = qdrant_client.collection_exists(collection_name=collection_name)
         if not collection_exists:
+            logger.warning("Nonexistent collection, creating and embedding...")
             qdrant_client.create_collection(
                 collection_name=collection_name,
                 vectors_config=VectorParams(
@@ -155,6 +137,7 @@ def embed_documents(json_path: str):
 
         # no need to create a vector store every time
         else:
+            logger.info("Collection found, fetching...")
             qdrant_store = QdrantVectorStore.from_existing_collection(
                 embedding=embeddings_model,
                 collection_name=collection_name,
@@ -162,7 +145,7 @@ def embed_documents(json_path: str):
             return qdrant_store
 
     except Exception as e:
-        print(f"Error initializing the vector store: {e}")
+        logger.error(f"Error initializing the vector store: {e}")
         return []
 
 
@@ -174,11 +157,11 @@ def smartphone_info_tool(model: str, tool_call_id: str) -> ToolMessage:
     """
     Retrieves information about a smartphone model and returns a ToolMessage.
     """
-    product_db = embed_documents("datasets/smartphones.json")
+    product_db = get_vector_store()
 
     if isinstance(product_db, list):
         content = f"Error: Vector store could not be initialized."
-        return ToolMessage(content=content, tool_call_id=tool_call_id)
+        return ToolMessage(content=content, tool_aicall_id=tool_call_id)
 
     try:
         results = product_db.similarity_search(model, k=1)
@@ -230,15 +213,16 @@ def generate_context(ai_message: AIMessage) -> list[BaseMessage]:
                 # LangChain tool's .invoke(tool_call) passes the 'args' dict to the function
                 # We need to manually pass tool_call_id if it's a separate parameter
                 tool_output: ToolMessage = smartphone_info_tool.invoke({
+                    "vector_store": get_vector_store(),
                     "model": tool_call["args"]["model"],
                     "tool_call_id": tool_call["id"]
                 })
                 current_conversation.append(tool_output)
 
     except Exception as e:
-        print(f"An error occurred while processing tool calls: {e}")
+        logger.error(f"An error occurred while processing tool calls: {e}")
         for tool_call in ai_message.tool_calls:
-        # Check if this tool_call was already answered successfully before the crash
+            # Check if this tool_call was already answered successfully before the crash
             if not any(isinstance(m, ToolMessage) and m.tool_call_id == tool_call["id"] for m in current_conversation):
                 current_conversation.append(
                     ToolMessage(
@@ -250,54 +234,16 @@ def generate_context(ai_message: AIMessage) -> list[BaseMessage]:
         return current_conversation
 
 
-
 def get_redis_history(session_id: str) -> BaseChatMessageHistory:
-    return ImprovedRedisChatMessageHistory(
+    return RedisChatMessageHistory(
         session_id=session_id,
-        redis_client=_redis_client,
+        redis_url=os.getenv("REDIS_CONNECTION_STRING"),
         ttl=os.getenv("REDIS_TTL_S")
     )
 
 
-class ImprovedRedisChatMessageHistory(RedisChatMessageHistory):
-    def add_message(self, message: BaseMessage) -> None:
-        if message is None:
-            raise ValueError("Message cannot be None")
-
-        timestamp = datetime.now().timestamp()
-        message_id = str(ULID())
-
-        data = {
-            "content": message.content,
-            "additional_kwargs": message.additional_kwargs,
-            "type": message.type,
-        }
-
-        if isinstance(message, AIMessage):
-            if message.tool_calls:
-                data["tool_calls"] = message.tool_calls
-            if message.invalid_tool_calls:
-                data["invalid_tool_calls"] = message.invalid_tool_calls
-            if message.usage_metadata:
-                data["usage_metadata"] = message.usage_metadata
-
-        common_data_to_store: Dict[str, Any] = {
-            "type": message.type,
-            "message_id": message_id,
-            "data": data,
-            "session_id": self.session_id,
-            "timestamp": timestamp,
-        }
-
-        if isinstance(message, ToolMessage):
-            common_data_to_store["data"]["tool_call_id"] = message.tool_call_id
-            common_data_to_store["data"]["status"] = message.status
-
-        self.index.load(
-            data=[common_data_to_store],
-            keys=[self._message_key(message_id)],
-            ttl=self.ttl,
-        )
+def get_clean_history(chat_hist: BaseChatMessageHistory):
+    return [m for m in chat_hist.messages if isinstance(m, (HumanMessage, AIMessage))]
 
 
 # ---------------------------
@@ -305,6 +251,7 @@ class ImprovedRedisChatMessageHistory(RedisChatMessageHistory):
 # ---------------------------
 @observe(name="main-loop")
 def main() -> None:
+
     langfuse_client = get_client()
     langfuse_client.update_current_trace(user_id=user_id, session_id=session_name)
 
@@ -314,19 +261,17 @@ def main() -> None:
     # Bind the tools to the language model instance
     llm_with_tools = llm.bind_tools(tools)
 
+    chat_history = get_redis_history(session_name)
 
     context_system_prompt = langfuse_client.get_prompt("context_system_prompt", label="latest")
     review_system_prompt = langfuse_client.get_prompt("review_system_prompt", label="latest")
     goodbye_system_prompt = langfuse_client.get_prompt("goodbye_system_prompt", label="latest")
 
-    rails = RunnableRails(rails_config, input_key="user_input", llm=llm)
-
     context_prompt = ChatPromptTemplate.from_messages(
         [
             context_system_prompt.get_langchain_prompt()[0],
-            MessagesPlaceholder(variable_name="conversation"),
-            context_system_prompt.get_langchain_prompt()[1]
-
+            context_system_prompt.get_langchain_prompt()[1],
+            MessagesPlaceholder(variable_name="conversation")
         ]
     )
 
@@ -343,122 +288,102 @@ def main() -> None:
     review_prompt.metadata = {"langfuse_prompt": review_system_prompt}
 
     goodbye_prompt = ChatPromptTemplate.from_messages(
-            goodbye_system_prompt.get_langchain_prompt()[0]
+        goodbye_system_prompt.get_langchain_prompt()[0]
     )
 
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_system_prompt}
 
-    token_llm = ChatOpenAI(
-        model=llm.model_name.replace("openai-", ""),  # Use a name LangChain understands for counting
-        base_url=os.getenv("LITELLM_BASEURL"),
-        api_key=os.getenv("LITELLM_API_KEY")
-    )
-
-    trimmer = trim_messages(
+    trimmer: Runnable = trim_messages(
         strategy="last",  # keep either the last or first messages
-        token_counter=token_llm,  # use your LLM to count tokens or create a special function
-        max_tokens=500,  # the maximum number of tokens
+        token_counter=llm,  # use your LLM to count tokens or create a special function
+        max_tokens=2000,  # the maximum number of tokens
         start_on="human",  # the first message type in the trimmed history
         end_on=("human", "tool"),
         include_system=True,  # always include the system message
     )
 
+    context_chain = context_prompt | llm_with_tools | RunnableLambda(generate_context)
 
-
-    context_chain = context_prompt | trimmer | llm_with_tools | generate_context
-
-    context_chain_with_history = RunnableWithMessageHistory(
-        runnable=context_chain,
-        get_session_history=get_redis_history,
-        input_messages_key="user_input",
-        history_messages_key="conversation"
-    )
-
-    context_chain_with_rails = (RunnablePassthrough.assign(output=rails) | context_chain_with_history)
-
-    review_chain = review_prompt | trimmer | llm
-
-    review_chain_with_history = RunnableWithMessageHistory(
-        runnable=review_chain,
-        get_session_history=get_redis_history,
-        input_messages_key="user_input",
-        history_messages_key="conversation"
-    )
-
-    review_chain_with_rails = (RunnablePassthrough.assign(output=rails) | review_chain_with_history)
+    review_chain = review_prompt | llm
 
     goodbye_chain = goodbye_prompt | llm
 
     try:
-        print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
+        print(f"{Color.CYAN}Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.{Color.RESET}")
         while True:
-            user_input = input("User: ").strip()
+            user_input = input(f"{Color.GREEN}User @ {session_name}: {Color.RESET}").strip()
             if user_input.lower() in ["exit", "quit", "bye", "end"]:
                 goodbye_message = goodbye_chain.invoke(
-                   input={"user_id": user_id},
-                   config=RunnableConfig(
-                       run_name="goodbye-message",
-                       callbacks=[langfuse_handler],
-                       metadata={
-                           "langfuse_session_id": session_name,
-                           "langfuse_user_id": user_id,
-                       }
-                   ))
+                    input={"user_id": user_id},
+                    config=RunnableConfig(
+                        run_name="goodbye-message",
+                        callbacks=[langfuse_handler],
+                        metadata={
+                            "langfuse_session_id": session_name,
+                            "langfuse_user_id": user_id,
+                        }
+                    ))
                 current_trace = langfuse_client.get_current_trace_id()
-                print("-*" * 20)
+                print(f"{Color.YELLOW}" + "-*" * 20 + f"{Color.RESET}")
                 user_score: int = 0
                 try:
-                    user_score = int(input(f"> How would you rate the relevance of my responses for trace_id {current_trace} (0-10)?: ").strip())
+                    user_score = int(input(
+                        f"{Color.YELLOW}> How would you rate the relevance of my responses for trace_id {current_trace} (0-10)?:{Color.RESET} ").strip())
                 except Exception as e:
-                    print("Unable to capture score")
+                    logger.warning("Unable to capture score")
 
                 user_comments: str = ""
                 try:
-                    user_comments = input("> Would you like to add any comments?: ").strip()
+                    user_comments = input(f"{Color.YELLOW}> Would you like to add any comments?:{Color.RESET} ").strip()
                 except Exception as e:
-                    print("Unable to capture comments")
-                print("-*" * 20)
-
+                    logger.warning("Unable to capture comments")
+                print(f"{Color.YELLOW}" + "-*" * 20 + f"{Color.RESET}")
 
                 langfuse_client.score_current_trace(
                     name="relevance",
-                    value=user_score/10,
+                    value=user_score / 10,
                     data_type="NUMERIC",
                     comment=user_comments
                 )
 
-                print(f"System: {goodbye_message.content}")
+                print(f"{Color.GRAY}System @ {session_name}: {goodbye_message.content}{Color.RESET}")
                 break
 
-            context_chain_with_rails.invoke({"user_input": user_input},
-                                config=RunnableConfig(
-                                       configurable={"session_id": session_name},
-                                       run_name="context",
-                                       callbacks=[langfuse_handler],
-                                       metadata={
-                                           "langfuse_session_id": session_name,
-                                           "langfuse_user_id": user_id,
-                                       }
-                                   ))
+            chat_history.add_message(HumanMessage(user_input))
 
-            response = review_chain_with_rails.invoke({"user_id": user_id, "user_input": user_input},
-                               config=RunnableConfig(
-                                   configurable={"session_id": session_name},
-                                   run_name="final-response",
-                                   callbacks=[langfuse_handler],
-                                   metadata={
-                                       "langfuse_session_id": session_name,
-                                       "langfuse_user_id": user_id,
-                                   }
-                               ))
+            trimmed_messages = trimmer.invoke(get_clean_history(chat_history))
 
-            print(f"System: {response.content}")
+            context_chain.invoke(
+                input={"user_input": user_input, "conversation": trimmed_messages},
+                config=RunnableConfig(
+                    configurable={"session_id": session_name},
+                    run_name="context",
+                    callbacks=[langfuse_handler],
+                    metadata={
+                        "langfuse_session_id": session_name,
+                        "langfuse_user_id": user_id,
+                    }
+                )
+            )
+
+            response = review_chain.invoke(
+                input={"user_id": user_id, "user_input": user_input, "conversation": get_clean_history(chat_history)},
+                config=RunnableConfig(
+                    configurable={"session_id": session_name},
+                    run_name="final-response",
+                    callbacks=[langfuse_handler],
+                    metadata={
+                        "langfuse_session_id": session_name,
+                        "langfuse_user_id": user_id,
+                    }
+                ))
+
+            print(f"{Color.GRAY}System @ {session_name}: {response.content}{Color.RESET}")
 
     except Exception as e:
-        print(f"An unexpected error occurred in the main loop: {e}")
+        print(f"ERROR: An unexpected error occurred in the main loop: {e}")
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-
