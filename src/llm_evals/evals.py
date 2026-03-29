@@ -4,13 +4,13 @@ import os
 import sys
 import uuid
 from pathlib import Path
-from llm_evals.utils import Color
 
 import dotenv
 from langchain_community.docstore.document import Document
+from langchain_core.globals import set_debug
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage, trim_messages
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
-from langchain_core.runnables import RunnableConfig, RunnableLambda, Runnable
+from langchain_core.runnables import RunnableConfig, RunnableLambda, RunnablePassthrough, Runnable
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
@@ -18,8 +18,12 @@ from langchain_redis import RedisChatMessageHistory
 from langchain_redis.chat_message_history import BaseChatMessageHistory
 from langfuse import observe, get_client
 from langfuse.langchain import CallbackHandler
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
+
+from llm_evals.utils import Color
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,7 +32,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
-dotenv.load_dotenv()
+_ = dotenv.load_dotenv()
+
+# set_verbose(True)
+set_debug(True)
 
 session_name = f"session-{uuid.uuid4().hex[:8]}"
 user_id = f"user-{uuid.uuid4().hex[:8]}"
@@ -51,6 +58,11 @@ embeddings_model = OpenAIEmbeddings(
 langfuse_handler = CallbackHandler()
 
 vector_store = None
+# Initialize Nemo config
+# Get the directory of the current file
+BASE_DIR = Path(__file__).resolve().parent
+config_path: Path = BASE_DIR / ".." / "config"
+rails_config = RailsConfig.from_path(str(config_path))
 
 def get_vector_store():
     global vector_store
@@ -234,6 +246,7 @@ def generate_context(ai_message: AIMessage) -> list[BaseMessage]:
         return current_conversation
 
 
+
 def get_redis_history(session_id: str) -> BaseChatMessageHistory:
     return RedisChatMessageHistory(
         session_id=session_id,
@@ -266,6 +279,8 @@ def main() -> None:
     context_system_prompt = langfuse_client.get_prompt("context_system_prompt", label="latest")
     review_system_prompt = langfuse_client.get_prompt("review_system_prompt", label="latest")
     goodbye_system_prompt = langfuse_client.get_prompt("goodbye_system_prompt", label="latest")
+
+    rails = RunnableRails(rails_config, input_key="user_input")
 
     context_prompt = ChatPromptTemplate.from_messages(
         [
@@ -304,7 +319,11 @@ def main() -> None:
 
     context_chain = context_prompt | llm_with_tools | RunnableLambda(generate_context)
 
+    context_chain_with_rails = (RunnablePassthrough.assign(output=rails) | context_chain)
+
     review_chain = review_prompt | llm
+
+    review_chain_with_rails = (RunnablePassthrough.assign(output=rails) | review_chain)
 
     goodbye_chain = goodbye_prompt | llm
 
@@ -323,6 +342,7 @@ def main() -> None:
                             "langfuse_user_id": user_id,
                         }
                     ))
+
                 current_trace = langfuse_client.get_current_trace_id()
                 print(f"{Color.YELLOW}" + "-*" * 20 + f"{Color.RESET}")
                 user_score: int = 0
@@ -353,7 +373,7 @@ def main() -> None:
 
             trimmed_messages = trimmer.invoke(get_clean_history(chat_history))
 
-            context_chain.invoke(
+            _ = context_chain_with_rails.invoke(
                 input={"user_input": user_input, "conversation": trimmed_messages},
                 config=RunnableConfig(
                     configurable={"session_id": session_name},
@@ -366,7 +386,7 @@ def main() -> None:
                 )
             )
 
-            response = review_chain.invoke(
+            response = review_chain_with_rails.invoke(
                 input={"user_id": user_id, "user_input": user_input, "conversation": get_clean_history(chat_history)},
                 config=RunnableConfig(
                     configurable={"session_id": session_name},
@@ -381,7 +401,7 @@ def main() -> None:
             print(f"{Color.GRAY}System @ {session_name}: {response.content}{Color.RESET}")
 
     except Exception as e:
-        print(f"ERROR: An unexpected error occurred in the main loop: {e}")
+        logger.error(f"ERROR: An unexpected error occurred in the main loop: {e}")
         sys.exit(1)
 
 
