@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sys
 import uuid
@@ -19,10 +20,9 @@ from langfuse import observe, get_client
 from langfuse.langchain import CallbackHandler
 from nemoguardrails import RailsConfig
 from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
-from nemoguardrails.logging.verbose import set_verbose
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
-import logging
+
 from llm_evals.utils import Color
 
 logging.basicConfig(
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 _ = dotenv.load_dotenv()
 
 # set_verbose(True)
-set_debug(True)
+set_debug(False)
 
 session_name = f"session-{uuid.uuid4().hex[:8]}"
 user_id = f"user-{uuid.uuid4().hex[:8]}"
@@ -43,14 +43,16 @@ user_id = f"user-{uuid.uuid4().hex[:8]}"
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    api_key=os.getenv("OPENAI_API_KEY")
+    model=os.getenv("LITELLM_MODEL"),
+    api_key=os.getenv("LITELLM_API_KEY"),
+    base_url=os.getenv("LITELLM_BASEURL")
 )
 
 # Initialize the embeddings model with OpenAI API credentials
 embeddings_model = OpenAIEmbeddings(
-    model=os.getenv("OPENAI_EMBEDDING_MODEL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
+    model=os.getenv("LITELLM_EMBEDDING_MODEL"),
+    api_key=os.getenv("LITELLM_API_KEY"),
+    base_url=os.getenv("LITELLM_BASEURL"),
     show_progress_bar=False,
 )
 
@@ -311,9 +313,15 @@ def main() -> None:
 
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_system_prompt}
 
+    token_llm: ChatOpenAI = ChatOpenAI(
+        model=llm.model.replace("openai-", ""),
+        api_key=os.getenv("LITELLM_API_KEY"),
+        base_url=os.getenv("LITELLM_BASEURL")
+    )
+
     trimmer: Runnable = trim_messages(
         strategy="last",  # keep either the last or first messages
-        token_counter=llm,  # use your LLM to count tokens or create a special function
+        token_counter=token_llm,  # use your LLM to count tokens or create a special function
         max_tokens=2000,  # the maximum number of tokens
         start_on="human",  # the first message type in the trimmed history
         end_on=("human", "tool"),
@@ -402,6 +410,7 @@ def main() -> None:
                 ))
 
             print(f"{Color.GRAY}System @ {session_name}: {response.content}{Color.RESET}")
+            print(rails.rails.explain())
 
     except Exception as e:
         logger.error(f"ERROR: An unexpected error occurred in the main loop: {e}")
